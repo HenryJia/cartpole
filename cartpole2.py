@@ -34,11 +34,17 @@ import gym
 
 from policy import epsilon_greedy, softmax_policy
 
-render = True # Cannot render in SSH connection
+# Cannot render in SSH connection
+train_render = False #True
+render = True
 
-seq_length = 512
-epochs = 200
+seq_length = 2048
+epochs = 1000
 print_epoch = 10
+
+solved = 0
+
+training_threshold = 2000
 
 env = gym.make('CartPole-v0')
 nb_actions = env.action_space.n
@@ -49,11 +55,16 @@ print 'Building models'
 def build_model(train = False):
     model = Sequential()
     if train == False:
-        model.add(LSTM(50, return_sequences = True, stateful = True, consume_less = 'gpu', batch_input_shape = (1, 1, nb_features)))
+        #model.add(LSTM(50, return_sequences = True, stateful = True, consume_less = 'gpu', batch_input_shape = (1, 1, nb_features)))
         #model.add(LSTM(50, return_sequences = True, stateful = True, consume_less = 'gpu'))
+        model.add(TimeDistributed(Dense(50), batch_input_shape = (1, 1, nb_features)))
     else:
-        model.add(LSTM(50, return_sequences = True, stateful = False, consume_less = 'gpu', batch_input_shape = (1, None, nb_features)))
+        #model.add(LSTM(50, return_sequences = True, stateful = False, consume_less = 'gpu', batch_input_shape = (1, None, nb_features)))
         #model.add(LSTM(50, return_sequences = True, stateful = False, consume_less = 'gpu'))
+        model.add(TimeDistributed(Dense(50), batch_input_shape = (1, None, nb_features)))
+    model.add(LeakyReLU())
+    model.add(TimeDistributed(Dense(50)))
+    model.add(LeakyReLU())
     model.add(TimeDistributed(Dense(nb_actions, activation = 'softmax')))
     return model
 
@@ -112,8 +123,8 @@ for j in xrange(epochs):
 
     model_run.reset_states()
     for t in xrange(seq_length):
-        #if render == True:
-            #env.render()
+        if train_render == True:
+            env.render()
         state_history += [np.reshape(state, (1, 1, -1))]
         # Run the run model
         action = model_run.predict_on_batch(np.reshape(state, (1, 1, -1)))
@@ -134,6 +145,12 @@ for j in xrange(epochs):
     ln_derivative_history = np.concatenate(ln_derivative_history, axis = 1)
     #print ln_derivative_history.shape
 
+    if np.sum(reward_history) >= training_threshold:
+        solved += 1
+    if solved >= 5:
+        print 'Score already sufficient to meet threshold ', np.sum(reward_history)
+        break
+
     policy_derivative = np.zeros_like(ln_derivative_history)
     for i in xrange(policy_derivative.shape[1]):
         policy_derivative[:, i] = np.sum(reward_history[i:]) * ln_derivative_history[:, i]
@@ -142,7 +159,9 @@ for j in xrange(epochs):
     model_run.set_weights(model_train.get_weights())
     reward_average = reward_total * 0.5 + reward_average * 0.5
     if (j + 1) % print_epoch == 0:
-        print 'Epoch, ', j, ' ', reward_average
+        print 'Episode ', j, ' - Score ', reward_average
+
+print 'Training complete! Let\'s test!'
 
 reward_total = 0
 state = env.reset()
