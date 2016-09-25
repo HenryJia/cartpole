@@ -34,10 +34,17 @@ import gym
 
 from policy import epsilon_greedy, softmax_policy
 
-render = True # Cannot render in SSH connection
+# Cannot render in SSH connection
+train_render = False #True
+render = True
 
-seq_length = 512
-epochs = 200
+seq_length = 2048
+epochs = 1000
+print_epoch = 10
+
+solved = 0
+
+training_threshold = 2000
 
 env = gym.make('CartPole-v0')
 nb_actions = env.action_space.n
@@ -48,15 +55,20 @@ print 'Building models'
 def build_model(train = False):
     model = Sequential()
     if train == False:
-        model.add(LSTM(50, return_sequences = True, stateful = True, consume_less = 'gpu', batch_input_shape = (1, 1, nb_features)))
+        #model.add(LSTM(50, return_sequences = True, stateful = True, consume_less = 'gpu', batch_input_shape = (1, 1, nb_features)))
         #model.add(LSTM(50, return_sequences = True, stateful = True, consume_less = 'gpu'))
+        model.add(TimeDistributed(Dense(50), batch_input_shape = (1, 1, nb_features)))
     else:
-        model.add(LSTM(50, return_sequences = True, stateful = False, consume_less = 'gpu', batch_input_shape = (1, None, nb_features)))
+        #model.add(LSTM(50, return_sequences = True, stateful = False, consume_less = 'gpu', batch_input_shape = (1, None, nb_features)))
         #model.add(LSTM(50, return_sequences = True, stateful = False, consume_less = 'gpu'))
+        model.add(TimeDistributed(Dense(50), batch_input_shape = (1, None, nb_features)))
+    model.add(LeakyReLU())
+    model.add(TimeDistributed(Dense(50)))
+    model.add(LeakyReLU())
     model.add(TimeDistributed(Dense(nb_actions, activation = 'softmax')))
     return model
 
-def policy_search(reward, actions): #(y_true, y_pred)
+def softmax_policy_search(reward, actions): #(y_true, y_pred)
     selected = K.switch(K.equal(reward, 0), 0, 1) # Assume reward/penalty for 1 action at each timestep
     selected_actions = K.clip(actions, 1e-8, 1 - 1e-8)  * selected # Clip for numerical stability
 
@@ -66,7 +78,7 @@ def policy_search(reward, actions): #(y_true, y_pred)
 
     selected_actions = K.sum(selected_actions, axis = axis)
 
-    logs = -K.log(selected_actions)
+    logs = K.log(selected_actions)
 
     reward_dimshuffle = K.permute_dimensions(K.sum(reward, axis = axis), (1, 0)) # Theano will scan across axis 0
     print reward_dimshuffle.ndim
@@ -79,8 +91,13 @@ def policy_search(reward, actions): #(y_true, y_pred)
 
     value = K.permute_dimensions(value_dimshuffle[::-1], (1, 0)) # Theano scan output is upside down so we flip, we also need to undo the permute
 
-    expectation = K.sum(logs * value, axis = 1) # Keras will mean over batch axis for us
+    expectation = -K.sum(logs * value, axis = 1) # Keras will mean over batch axis for us
     return expectation
+
+# We perform derivative of the policy and multiply by reward sum outside of Keras.
+# Then we just multiply with network derivative by chain rule
+def policy_search(policy_derivative, network): #(y_true, y_pred)
+    return -K.sum(network * policy_derivative, axis = 1)
 
 model_run = build_model(train = False) # We will use this one to run and generate a series of actions
 model_train = build_model(train = True) # We will use this one to train once we know the actions
@@ -99,34 +116,52 @@ for j in xrange(epochs):
 
     state_history = []
     reward_history = []
+    ln_derivative_history = []
 
     # Reset game environment
     state = env.reset()
 
     model_run.reset_states()
     for t in xrange(seq_length):
-        #if render == True:
-            #env.render()
+        if train_render == True:
+            env.render()
         state_history += [np.reshape(state, (1, 1, -1))]
         # Run the run model
         action = model_run.predict_on_batch(np.reshape(state, (1, 1, -1)))
-        action = softmax_policy(action)
+        action, ln_derivative = softmax_policy(action)
         action = np.argmax(action)
         state, reward, done, info = env.step(action)
-        reward_onehot = np.zeros((1, 1, nb_actions))
-        reward_onehot[0, 0, action] = reward if reward != 0 else -1e-8
-        reward_history += [reward_onehot]
+        #reward_onehot = np.zeros((1, 1, nb_actions))
+        #reward_onehot[0, 0, action] = reward if reward != 0 else -1e-8
+        reward_history += [reward]
+        ln_derivative_history += [ln_derivative]
         reward_total += reward
 
         if done:
             break
 
     state_history = np.concatenate(state_history, axis = 1)
-    reward_history = np.concatenate(reward_history, axis = 1)
-    model_train.train_on_batch(state_history, reward_history)
+    reward_history = np.array(reward_history)
+    ln_derivative_history = np.concatenate(ln_derivative_history, axis = 1)
+    #print ln_derivative_history.shape
+
+    if np.sum(reward_history) >= training_threshold:
+        solved += 1
+    if solved >= 5:
+        print 'Score already sufficient to meet threshold ', np.sum(reward_history)
+        break
+
+    policy_derivative = np.zeros_like(ln_derivative_history)
+    for i in xrange(policy_derivative.shape[1]):
+        policy_derivative[:, i] = np.sum(reward_history[i:]) * ln_derivative_history[:, i]
+
+    model_train.train_on_batch(state_history, policy_derivative)
     model_run.set_weights(model_train.get_weights())
     reward_average = reward_total * 0.5 + reward_average * 0.5
-    print 'Epoch, ', j, ' ', reward_average
+    if (j + 1) % print_epoch == 0:
+        print 'Episode ', j, ' - Score ', reward_average
+
+print 'Training complete! Let\'s test!'
 
 reward_total = 0
 state = env.reset()
